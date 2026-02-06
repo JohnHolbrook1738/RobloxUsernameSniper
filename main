@@ -1,1 +1,304 @@
+#!/usr/bin/env python3
+"""Fast, customizable Roblox username checker/sniper."""
 
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import string
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+
+ROBLOX_VALIDATE_URL = "https://auth.roblox.com/v1/usernames/validate"
+DEFAULT_BIRTHDAY = "2000-01-01T00:00:00.000Z"
+LOGO = r"""
+██    ██ ███████ ███████ ██████  ███    ██  █████  ███    ███ ███████     ███████ ███    ██ ██ ██████  ███████ ██████
+██    ██ ██      ██      ██   ██ ████   ██ ██   ██ ████  ████ ██          ██      ████   ██ ██ ██   ██ ██      ██   ██
+██    ██ ███████ █████   ██████  ██ ██  ██ ███████ ██ ████ ██ █████       ███████ ██ ██  ██ ██ ██████  █████   ██████
+██    ██      ██ ██      ██   ██ ██  ██ ██ ██   ██ ██  ██  ██ ██               ██ ██  ██ ██ ██ ██      ██      ██   ██
+ ██████  ███████ ███████ ██   ██ ██   ████ ██   ██ ██      ██ ███████     ███████ ██   ████ ██ ██      ███████ ██   ██
+"""
+
+
+class Stats:
+    def __init__(self) -> None:
+        self.checked = 0
+        self.available = 0
+        self.failed = 0
+        self.lock = threading.Lock()
+
+    def add_result(self, available: bool, failed: bool) -> None:
+        with self.lock:
+            self.checked += 1
+            if available:
+                self.available += 1
+            if failed:
+                self.failed += 1
+
+    def snapshot(self) -> tuple[int, int, int]:
+        with self.lock:
+            return self.checked, self.available, self.failed
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Fast Roblox username checker/sniper with customizable filters"
+    )
+    parser.add_argument("--interactive", action="store_true", help="Use prompt-based setup")
+    parser.add_argument("--min-length", type=int, default=3, help="Minimum username length")
+    parser.add_argument("--max-length", type=int, default=12, help="Maximum username length")
+    parser.add_argument("--letters", action="store_true", help="Include letters")
+    parser.add_argument("--numbers", action="store_true", help="Include numbers")
+    parser.add_argument("--uppercase", action="store_true", help="Include uppercase letters")
+    parser.add_argument("--lowercase", action="store_true", help="Include lowercase letters")
+    parser.add_argument("--prefix", default="", help="Username prefix")
+    parser.add_argument("--suffix", default="", help="Username suffix")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=75,
+        help="Parallel workers (higher = faster but may hit rate limits)",
+    )
+    parser.add_argument("--batch-size", type=int, default=300, help="How many usernames to keep in flight")
+    parser.add_argument("--find", type=int, default=1, help="Number of available usernames to find before stopping")
+    parser.add_argument("--max-checks", type=int, default=0, help="Stop after this many checks (0 = unlimited)")
+    parser.add_argument("--timeout", type=float, default=7.0, help="Request timeout in seconds")
+    parser.add_argument(
+        "--print-checked",
+        action="store_true",
+        help="Print every checked username result (slower, but useful for debugging)",
+    )
+    parser.add_argument("--status-interval", type=float, default=2.0, help="Seconds between status updates")
+    return parser.parse_args()
+
+
+def _ask_bool(prompt: str, default: bool) -> bool:
+    suffix = "Y/n" if default else "y/N"
+    raw = input(f"{prompt} [{suffix}]: ").strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes", "true", "1"}
+
+
+def _ask_int(prompt: str, default: int, min_value: int = 0) -> int:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    if not raw:
+        return default
+    value = int(raw)
+    if value < min_value:
+        raise ValueError(f"{prompt} must be >= {min_value}")
+    return value
+
+
+def _ask_float(prompt: str, default: float, min_value: float = 0.1) -> float:
+    raw = input(f"{prompt} [{default}]: ").strip()
+    if not raw:
+        return default
+    value = float(raw)
+    if value < min_value:
+        raise ValueError(f"{prompt} must be >= {min_value}")
+    return value
+
+
+def configure_from_inputs(args: argparse.Namespace) -> argparse.Namespace:
+    print("\nInteractive setup (press Enter to keep defaults):")
+    args.letters = _ask_bool("Include letters?", True)
+    args.numbers = _ask_bool("Include numbers?", True)
+    args.lowercase = _ask_bool("Include lowercase letters?", True)
+    args.uppercase = _ask_bool("Include uppercase letters?", False)
+    args.min_length = _ask_int("Minimum length", args.min_length, 1)
+    args.max_length = _ask_int("Maximum length", args.max_length, 1)
+    args.prefix = input(f"Prefix [{args.prefix}]: ").strip() or args.prefix
+    args.suffix = input(f"Suffix [{args.suffix}]: ").strip() or args.suffix
+    args.workers = _ask_int("Workers (higher = faster)", args.workers, 1)
+    args.batch_size = _ask_int("Batch size (in-flight checks)", args.batch_size, 1)
+    args.find = _ask_int("How many available names to find", args.find, 1)
+    args.max_checks = _ask_int("Max checks (0 = unlimited)", args.max_checks, 0)
+    args.timeout = _ask_float("Request timeout seconds", args.timeout, 0.1)
+    args.status_interval = _ask_float("Status update interval seconds", args.status_interval, 0.1)
+    args.print_checked = _ask_bool("Print every checked username?", args.print_checked)
+    return args
+
+
+def build_charset(args: argparse.Namespace) -> str:
+    include_letters = args.letters or (not args.letters and not args.numbers)
+    include_numbers = args.numbers or (not args.letters and not args.numbers)
+
+    chars = ""
+    if include_letters:
+        include_lower = args.lowercase or not args.uppercase
+        include_upper = args.uppercase
+        if include_lower:
+            chars += string.ascii_lowercase
+        if include_upper:
+            chars += string.ascii_uppercase
+    if include_numbers:
+        chars += string.digits
+
+    if not chars:
+        raise ValueError("No characters available. Enable letters and/or numbers.")
+
+    return chars
+
+
+def generate_username(charset: str, min_length: int, max_length: int, prefix: str, suffix: str) -> str:
+    if min_length > max_length:
+        raise ValueError("min-length cannot be greater than max-length")
+
+    fixed_len = len(prefix) + len(suffix)
+    if fixed_len > max_length:
+        raise ValueError("prefix + suffix is longer than max-length")
+
+    content_min = max(0, min_length - fixed_len)
+    content_max = max_length - fixed_len
+    if content_min > content_max:
+        raise ValueError("length constraints are impossible with current prefix/suffix")
+
+    content_len = random.randint(content_min, content_max)
+    core = "".join(random.choice(charset) for _ in range(content_len))
+    return f"{prefix}{core}{suffix}"
+
+
+def check_username(username: str, timeout: float) -> tuple[str, bool, str]:
+    params = {
+        "request.username": username,
+        "request.birthday": DEFAULT_BIRTHDAY,
+        "request.context": "Signup",
+    }
+    url = f"{ROBLOX_VALIDATE_URL}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 username-checker"})
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            return username, False, "RATE_LIMITED"
+        return username, False, f"HTTP_{exc.code}"
+    except Exception:
+        return username, False, "REQUEST_FAILED"
+
+    code = data.get("code")
+    message = str(data.get("message", "")).upper()
+    available = code == 0 or "VALID" in message
+
+    if not available and "TAKEN" in message:
+        return username, False, "TAKEN"
+
+    return username, available, message or "UNAVAILABLE"
+
+
+def run(args: argparse.Namespace) -> int:
+    charset = build_charset(args)
+    stats = Stats()
+    seen: set[str] = set()
+    found: list[str] = []
+
+    start = time.time()
+    last_status = start
+
+    print(LOGO)
+    print("Starting Roblox username sniper...")
+    print(
+        f"Settings => length: {args.min_length}-{args.max_length}, workers: {args.workers}, "
+        f"batch-size: {args.batch_size}, find: {args.find}, prefix: '{args.prefix}', suffix: '{args.suffix}'"
+    )
+
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        future_to_username: dict[Future[tuple[str, bool, str]], str] = {}
+
+        def submit_one() -> None:
+            while True:
+                candidate = generate_username(charset, args.min_length, args.max_length, args.prefix, args.suffix)
+                if candidate not in seen:
+                    seen.add(candidate)
+                    break
+            fut = executor.submit(check_username, candidate, args.timeout)
+            future_to_username[fut] = candidate
+
+        for _ in range(max(1, args.batch_size)):
+            submit_one()
+
+        while future_to_username:
+            done, _ = wait(future_to_username, return_when=FIRST_COMPLETED)
+            for fut in done:
+                future_to_username.pop(fut, None)
+                try:
+                    username, available, reason = fut.result()
+                except Exception:
+                    username, available, reason = "<unknown>", False, "WORKER_ERROR"
+
+                failed = reason in {"RATE_LIMITED", "REQUEST_FAILED", "WORKER_ERROR"} or reason.startswith("HTTP_")
+                stats.add_result(available=available, failed=failed)
+
+                if reason == "RATE_LIMITED":
+                    print("[rate-limit] Sleeping for 5 seconds to allow limits to reset...")
+                    time.sleep(5)
+
+                if args.print_checked:
+                    tag = "AVAILABLE" if available else "taken"
+                    print(f"[{tag}] {username} ({reason})")
+
+                if available:
+                    found.append(username)
+                    print(f"\n[AVAILABLE] {username}\n")
+                    if len(found) >= args.find:
+                        checked, avail, failed_count = stats.snapshot()
+                        elapsed = max(time.time() - start, 0.001)
+                        print("Done: target reached.")
+                        print(
+                            f"Checked={checked} Available={avail} Failed={failed_count} "
+                            f"Rate={checked/elapsed:.2f}/sec"
+                        )
+                        print("Found usernames:")
+                        for name in found:
+                            print(f" - {name}")
+                        return 0
+
+                checked, _, _ = stats.snapshot()
+                if args.max_checks and checked >= args.max_checks:
+                    elapsed = max(time.time() - start, 0.001)
+                    print("Done: max-checks reached.")
+                    print(f"Checked={checked} Rate={checked/elapsed:.2f}/sec")
+                    print("Found usernames:")
+                    for name in found:
+                        print(f" - {name}")
+                    return 0
+
+                if time.time() - last_status >= args.status_interval:
+                    checked, avail, failed_count = stats.snapshot()
+                    elapsed = max(time.time() - start, 0.001)
+                    print(
+                        f"[status] checked={checked} available={avail} failed={failed_count} "
+                        f"rate={checked/elapsed:.2f}/sec inflight={len(future_to_username)}"
+                    )
+                    last_status = time.time()
+
+                if not args.max_checks or stats.snapshot()[0] < args.max_checks:
+                    submit_one()
+
+    return 0
+
+
+def main() -> int:
+    try:
+        args = parse_args()
+        if args.interactive or len(sys.argv) == 1:
+            args = configure_from_inputs(args)
+        return run(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.")
+        return 130
+    except Exception as exc:
+        print(f"Error: {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
