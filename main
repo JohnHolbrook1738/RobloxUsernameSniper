@@ -237,6 +237,10 @@ def run(args: argparse.Namespace) -> int:
                 failed = reason in {"RATE_LIMITED", "REQUEST_FAILED", "WORKER_ERROR"} or reason.startswith("HTTP_")
                 stats.add_result(available=available, failed=failed)
 
+                if reason == "RATE_LIMITED":
+                    print("[rate-limit] Sleeping for 5 seconds to allow limits to reset...")
+                    time.sleep(5)
+
                 if args.print_checked:
                     tag = "AVAILABLE" if available else "taken"
                     print(f"[{tag}] {username} ({reason})")
